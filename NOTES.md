@@ -382,3 +382,8 @@ Now determine: [[-!'  → Answer: @&
 - System prompt should NOT add additional few-shot examples (would confuse the model)
 - System prompt should be minimal: `"You are a logical reasoning assistant. Think step by step. Put your final answer inside \\boxed{}."`
 - Don't over-engineer the system prompt — the puzzle prompt already does the heavy lifting
+
+### Hardware & Framework Updates (Phase 1)
+- Upgraded to local **RTX 6000 (~48GB VRAM)**. This enables higher batch sizes (e.g. `BATCH_SIZE = 4`) and much faster training epochs.
+- `trl` package is unavailable in the offline environment, so we are now using the standard `transformers.Trainer` with a custom dataset `.map()` tokenization function and `DataCollatorForLanguageModeling(mlm=False)`.
+- Replaced Unsloth references since the model relies on the Mamba architecture which Unsloth currently does not support.
