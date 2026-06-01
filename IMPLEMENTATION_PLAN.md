@@ -158,107 +158,261 @@ Always place your final answer inside \boxed{}.
 ## Phase 2 — SFT with Chain-of-Thought Reasoning
 
 **Goal:** Teach the model to reason step-by-step. Expected to be the biggest accuracy jump.
+**Baseline to beat:** LB **0.63**, local **0.561**
 
-### Step 2a — Proxy Model Validation (Qwen2.5-7B)
+> [!IMPORTANT]
+> Phase 1 used a custom `<|system|>...<|user|>...<|assistant|>` format. The **metric evaluator
+> uses `apply_chat_template(..., enable_thinking=True)`** which produces a different prompt structure.
+> Phase 2 training must match this format, otherwise we're training in a different distribution
+> than what the model is evaluated in.
 
-Before spending Kaggle GPU hours on the 30B model, validate the entire SFT pipeline on a smaller model.
+### 🔑 Key Change from Phase 1: Training Format
 
-**Notebook:** `phase2_proxy_sft.ipynb` (run on Kaggle T4)
+**Phase 1 format (wrong for evaluation):**
+```
+<|system|>
+{system_prompt}
+<|user|>
+{puzzle_prompt}
+<|assistant|>
+\boxed{answer}
+```
 
-- Use **Qwen2.5-7B-Instruct** (fits easily on RTX 6000)
-- Train with the same PyTorch PEFT config (just swap model name and target_modules to q_proj, v_proj, etc.)
-- Verify the pipeline: data loading → training → inference → `\boxed{}` extraction → accuracy
-- If proxy model improves over no-training baseline → pipeline is correct → proceed to 30B
+**Phase 2 format (matches evaluation):**
+Use the tokenizer's own `apply_chat_template` with `enable_thinking=True`:
+```python
+# Build the training string using the tokenizer's chat template
+user_content = puzzle_prompt  # evaluator appends \boxed instruction itself
+assistant_content = f"<think>\n{cot_reasoning}\n</think>\n\\boxed{{{answer}}}"
 
-> [!TIP]
-> Proxy model training takes minutes on RTX 6000. It catches bugs before wasting time on the 30B.
+# Apply the same template the evaluator uses
+full_text = tokenizer.apply_chat_template(
+    [
+        {'role': 'user', 'content': user_content},
+        {'role': 'assistant', 'content': assistant_content},
+    ],
+    tokenize=False,
+    enable_thinking=True,
+)
+```
+
+**Why this matters:**
+- Nemotron-H has a dedicated `<think>` token / thinking mode built in
+- Training with `<think>...</think>` teaches the model to use its scratchpad before answering
+- The 7% LB vs local gap suggests the model already *wants* to think when given room
+- `max_tokens=3584` in evaluation is designed for reasoning chains
 
 ---
 
-### Step 2b — CoT Generation with Gemini API
+### Step 2a — Proxy Model Validation (Qwen2.5-7B)
 
-**Notebook:** `phase2_cot_generation.ipynb` (runs on CPU / local machine)
+Before spending Kaggle GPU hours on the 30B model, validate the pipeline on a smaller model.
 
-Use the Gemini free API to generate step-by-step reasoning chains for every training example.
-This uses **backsolved rationalization**: give Gemini both the puzzle AND the correct answer,
-and ask it to explain the reasoning. This is far more reliable than cold-solving.
+**Notebook:** `phase2_proxy_sft.ipynb`
+
+- Use **Qwen2.5-7B-Instruct** (fits easily on RTX 6000)
+- Apply `apply_chat_template` with the equivalent thinking format
+- Train for 1 epoch, eval on 10% split
+- Verify: accuracy > Phase 1 baseline on proxy model → pipeline is correct
+- Quick iteration: full Qwen-7B cycle takes ~30 min vs 7h for 30B
+
+> [!TIP]
+> Proxy model training takes ~30 min on RTX 6000. Catches format bugs before wasting compute.
+
+---
+
+### Step 2b — CoT Generation (runs on local WSL machine)
+
+> [!IMPORTANT]
+> **This notebook does NOT run on Kaggle.** The Kaggle GPU container is offline.
+> Run `phase2_cot_generation.ipynb` on your **local WSL machine**, which has internet.
+> No GPU needed — just CPU + Gemini API calls. Does not consume Kaggle GPU quota.
+
+**Data flow:**
+```
+Local WSL (internet, CPU only)         Kaggle (offline GPU container)
+──────────────────────────────         ──────────────────────────────
+phase2_cot_generation.ipynb            phase2_sft.ipynb
+  ↓ Gemini API calls (~9h overnight)     ↓ reads from Dataset
+  ↓ saves cot_train.json                 ↓ /kaggle/input/nemotron-cot/
+  → upload to Kaggle Dataset  ─────────→
+```
+
+**Notebook:** `phase2_cot_generation.ipynb` (local machine, no Kaggle needed)
+
+Use the Gemini free API to generate `<think>...</think>` reasoning chains.
+This uses **backsolved rationalization**: give Gemini the puzzle AND the correct answer.
 
 **Prompt template sent to Gemini:**
 ```
-Solve this logic puzzle step by step. Show your full reasoning.
-At the end, confirm: FINAL ANSWER: <answer>
+You are solving a logical puzzle step by step.
 
 Puzzle:
 {prompt}
 
 The correct answer is: {answer}
 
-Generate a detailed step-by-step explanation of how to arrive at this answer.
+Provide a detailed step-by-step reasoning that explains HOW to arrive at this answer.
+Your reasoning should:
+1. Identify the hidden rule from the given examples
+2. Verify the rule holds for ALL examples shown
+3. Apply the rule to the test input to get the answer
+
+Format your response as just the reasoning text (no preamble, no final answer line).
+The reasoning will be placed inside <think>...</think> tags.
 ```
 
-**Output saved per example:**
+**Training record saved per example:**
 ```json
 {
   "id": "00066667",
   "prompt": "...",
-  "cot": "Step 1: ... Step 2: ... Therefore the answer is 10010111.",
+  "cot": "Looking at the examples, I notice that each binary string...",
   "answer": "10010111"
 }
 ```
 
+**CoT generation priority (hardest first — most value):**
+| Priority | Category | Phase 1 acc | CoT target | Reason |
+|---|---|---|---|---|
+| 1 | `other` | 3.0% | 50%+ | Completely broken, highest gain |
+| 2 | `binary` | 48.6% | 75%+ | Per-puzzle rules, must reason per-example |
+| 3 | `integer_math` | 40.0% | 70%+ | Custom operators, needs explicit deduction |
+| 4 | `decimal_math` | 52.2% | 85%+ | Find ratio — systematic CoT should dominate |
+| 5 | `word_sequence` | 64.7% | 80%+ | Build cipher map, already decent without CoT |
+| 6 | `roman_numerals` | **100%** | Skip | Perfect already, don't waste API quota |
+
 **Rate limits & cost:**
 - Gemini free tier: ~15 RPM → use `time.sleep(4)` between calls
-- ~1000 examples ≈ 1–2 hours of generation
-- Fallback: Groq (llama-3.3-70b-versatile, generous free tier) or OpenAI gpt-4o-mini
+- ~9500 examples (minus roman_numerals ~1580) = ~7920 to generate
+- At 4s/call = ~8.8 hours of generation — run overnight
+- Fallback: Groq (llama-3.3-70b-versatile, generous free tier, also free)
 
 > [!IMPORTANT]
-> Save the generated CoT dataset to a Kaggle Dataset so it persists across notebook sessions.
-> File name: `cot_train.json`
+> Save the generated CoT dataset to a **Kaggle Dataset** so it persists.
+> File name: `cot_train.json`. Never rely on `/kaggle/working/` for persistence.
 
 ---
 
-### Step 2c — SFT Training on Nemotron-30B with CoT
+### Step 2c — SFT on Nemotron-30B with CoT
 
 **Notebook:** `phase2_sft.ipynb`
 
-**Training input format (with CoT):**
-```
-<system>
-You are an expert logical reasoning assistant.
-Think step by step, then place your final answer inside \boxed{}.
-</system>
-<user>
-{prompt}
-</user>
-<assistant>
-{cot}
+**Training config (same as Phase 1 base, with key changes):**
 
-\boxed{{answer}}
-</assistant>
-```
+| Parameter | Phase 1 | Phase 2 Change | Reason |
+|---|---|---|---|
+| `max_seq_length` | 512 | **2048** | CoT chains are 200–800 tokens |
+| `BATCH_SIZE` | 8 | **4** | Longer sequences → more VRAM per example |
+| `GRAD_ACCUM` | 2 | **4** | Keep effective batch = 16 |
+| `LEARNING_RATE` | 5e-5 | **3e-5** | Slightly lower — fine-tune on top of Phase 1 |
+| `NUM_EPOCHS` | 3 | **3** | Same |
+| Training format | `\boxed{answer}` | **`<think>cot</think>\n\boxed{answer}`** | Match evaluation |
+| Starting checkpoint | Base model | **Phase 1 adapter** | Warm start |
 
-Use the same PEFT hyperparameters from Phase 1. Increase `max_seq_length` to **4096** to
-accommodate longer CoT sequences.
+**Warm-starting from Phase 1 adapter:**
+```python
+# Load base model, then load Phase 1 LoRA weights as initialisation
+from peft import PeftModel
+model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, ...)
+model = PeftModel.from_pretrained(model, "phase1_adapter/")  # warm start
+model = model.merge_and_unload()  # merge, then apply fresh LoRA for Phase 2
+# OR: continue training the same LoRA (simpler)
+```
 
 ---
 
-### Step 2d — Data Augmentation Experiments (Benchmarked)
+### Step 2d — Custom Metric Local Evaluation
+
+> [!IMPORTANT]
+> The Kaggle container is **offline** — you cannot `import` from local paths like `utils/`.
+> Copy the metric functions **directly into a notebook cell**. No external imports.
+
+**Copy these two functions verbatim into the eval cell of `phase2_sft.ipynb`:**
+
+```python
+# ── Copied from utils/nvidia-nemotron-metric.py (competition metric) ──────────
+import re, math
+
+def extract_final_answer(text):
+    """Competition metric answer extractor. Prioritizes \\boxed{}, then text patterns."""
+    if text is None:
+        return 'NOT_FOUND'
+    boxed_starts = list(re.finditer(r'\\boxed\{', text))
+    matches = []
+    for i, m in enumerate(boxed_starts):
+        start = m.end()
+        end = boxed_starts[i + 1].start() if i + 1 < len(boxed_starts) else len(text)
+        segment = text[start:end]
+        last_brace = segment.rfind('}')
+        matches.append(segment[:last_brace] if last_brace != -1 else segment)
+    if matches:
+        non_empty = [m.strip() for m in matches if m.strip()]
+        return non_empty[-1] if non_empty else matches[-1].strip()
+    for pattern in [
+        r'The final answer is:\s*([^\n]+)',
+        r'Final answer is:\s*([^\n]+)',
+        r'final answer\s*[:：]\s*([^\n]+)',
+    ]:
+        found = re.findall(pattern, text, re.IGNORECASE)
+        if found:
+            return found[-1].strip()
+    nums = re.findall(r'-?\d+(?:\.\d+)?', text)
+    if nums:
+        return nums[-1]
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return lines[-1] if lines else 'NOT_FOUND'
+
+def verify(stored_answer, predicted):
+    """Competition metric grader. Exact string match or 1% numerical tolerance."""
+    stored_answer = stored_answer.strip()
+    predicted = predicted.strip()
+    if re.fullmatch(r'[01]+', stored_answer):   # binary: always exact
+        return predicted.lower() == stored_answer.lower()
+    try:
+        return math.isclose(float(stored_answer), float(predicted),
+                            rel_tol=1e-2, abs_tol=1e-5)
+    except Exception:
+        return predicted.lower() == stored_answer.lower()
+# ─────────────────────────────────────────────────────────────────────────────
+```
+
+**Use competition inference parameters (not our Phase 1 greedy settings):**
+
+```python
+generation_config = dict(
+    max_new_tokens=1024,   # allow reasoning chains (not 64)
+    do_sample=True,        # stochastic, matches evaluator
+    temperature=1.0,       # matches evaluator
+    top_p=1.0,             # matches evaluator
+)
+```
+
+**Expected result:** local eval score should now track LB score within 1–2%.
+
+**Eval speed improvement:** Phase 1 local eval = 200 min on 1900 examples.
+- Reduce eval split to **10%** (950 examples) → ~100 min
+- Or use batched inference with padded inputs (batch_size=2–4)
+
+---
+
+### Step 2e — Data Augmentation Experiments
 
 Run **two variants** and compare leaderboard scores:
 
-**Variant A — Competition data only (70% train, 30% held-out eval)**
+**Variant A — Competition CoT data only**
 - Only `cot_train.json` (backsolved CoT from train.csv)
+- Clean baseline for measuring CoT benefit
 
-**Variant B — Competition + Public data (70/30 mix)**
+**Variant B — Competition + Public reasoning data**
 - 70% competition CoT data
 - 30% public reasoning datasets:
-  - `AI-MO/NuminaMath-CoT` (math competition, HF)
-  - `nvidia/OpenMathInstruct-2` (NVIDIA's own, HF)
-  - `openai/gsm8k` (grade school math)
+  - `AI-MO/NuminaMath-CoT` (math — helps `decimal_math`, `integer_math`)
+  - `openai/gsm8k` (grade school math, easy to format as thinking traces)
 
 > [!TIP]
-> Submit both adapters and compare scores. Keep whichever is higher. Too much public data
-> may hurt on the specific puzzle types in the test set.
+> Submit Variant A first — it's faster and tells us the clean CoT benefit.
+> Only run Variant B if time permits after comparing LB scores.
 
 ---
 
@@ -403,13 +557,24 @@ nemotron_reasoning_challenge/
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| CoT generator | Gemini free API (fallback: Groq/OpenAI) | Free, fast, high quality |
-| Pipeline validation | Qwen2.5-7B proxy first | Catch bugs before wasting 30B GPU hours |
+| CoT generator (P2a) | Nemotron itself (STaR) | Offline container, no internet; model knows puzzle domain; backsolved ~85% pass rate |
+| CoT generator (P2b) | Gemini free API (local WSL) | Higher quality, more diverse reasoning; runs locally overnight, no GPU cost |
+| STaR adapter reuse | Phase 1 adapter for BOTH generation AND training init | Teacher knows domain; warm-start cuts epochs 3→2; quality filter prevents circular reinforcement |
+| Pipeline validation | Qwen2.5-7B proxy first | Catch format/pipeline bugs before spending 30B GPU hours |
 | Augmentation | Run both with/without, benchmark | Empirical — can't know without trying |
-| Phase 3 compute | Local RTX 6000 | Custom PyTorch GRPO required since TRL is unavailable |
+| Phase 3 compute | Local RTX 6000 | Custom PyTorch GRPO required since TRL unavailable |
 | Phase 3 priority | Aspirational/bonus | Time and memory constrained |
 | Code structure | Separate notebooks per phase | Easier to iterate, cleaner Kaggle sessions |
 | LoRA rank | 32 (max allowed by competition) | Maximize adapter capacity |
+| Training format P1 | Manual `<\|user\|>...<\|assistant\|>\\boxed{}` | Quick baseline; **wrong for evaluation** — see Challenge 6 |
+| Training format P2 | `apply_chat_template(enable_thinking=True)` + `<think>cot</think>\n\\boxed{}` | Matches competition evaluator exactly |
+| Local eval params P1 | Greedy, max_new_tokens=64 | Fast iteration; **wrong** — diverges 7% from LB |
+| Local eval params P2 | temp=1.0, top_p=1.0, max_new_tokens=1024 + competition `verify()` | Matches evaluator; local score now tracks LB within 1-2% |
+| Metric function usage | Copy-paste into notebook | Kaggle container offline; no `utils/` imports possible |
+| CoT generation batching | batch=2 (generation), left-padding | Mamba O(1) state: ~2x throughput. Left-pad required for batched causal LM inference |
+| Eval split size | 5% (~475 examples) | Phase 1's 20% (1900 ex) took 200 min; 5% gives ~50 min with representative signal |
+| roman_numerals CoT | Skip | Already 100% accuracy; wasted generation budget |
+| Checkpoint cadence | Every 200 examples | Recoverable if 10h session times out mid-generation |
 
 ---
 
