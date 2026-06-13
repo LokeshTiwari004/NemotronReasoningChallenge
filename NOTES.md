@@ -551,7 +551,6 @@ Our local eval forces `max_new_tokens=64` and greedy decoding. The LB uses 3584 
 - Remaining budget per week: ~23 hrs
 - Phase 2 SFT: ~3.5–4h training (same config), eval: ~3.5h → **~7.5h total**
 - Phase 3 GRPO: ~4–6h
-- **Total remaining phases: ~14h** — within weekly budget if spread across 2 weeks
 - **Optimization for eval time:** eval on 1900 examples took 200 min (6.3 sec/example). Could sample 500 for faster iteration.
 - Don't forget: CPU-only notebooks (EDA, CoT generation) don't count against GPU quota
 
@@ -612,5 +611,104 @@ These are major discoveries that should influence Phase 2 training:
 
 ### Hardware & Framework Updates (Phase 1)
 - Upgraded to Kaggle container **RTX 6000 (~95GB VRAM)**. This enables higher batch sizes (e.g. `BATCH_SIZE = 8`) and much faster training epochs.
-- `trl` package is unavailable in the offline environment, so we are now using the standard `transformers.Trainer` with a custom dataset `.map()` tokenization function and `DataCollatorForLanguageModeling(mlm=False)`.
-- Replaced Unsloth references since the model relies on the Mamba architecture which Unsloth currently does not support.
+
+#### ✅ `trl` is now available in the Kaggle offline environment
+
+This is a significant unblock. `trl` was previously assumed unavailable, which forced a plan to hand-roll a custom GRPO training loop. With `trl` confirmed available, the following capabilities are now on the table:
+
+| `trl` Capability | Relevance |
+|---|---|
+| `SFTTrainer` | Drop-in replacement for `transformers.Trainer` for Phase 2; handles `formatting_func`, packing, and `DataCollatorForCompletionOnlyLM` natively |
+| `GRPOTrainer` | Phase 3 is now viable with standard `trl` API — no custom RL loop needed |
+| `DataCollatorForCompletionOnlyLM` | Masks the prompt tokens during loss computation — critical for Phase 2 CoT training to avoid penalising the question portion |
+| Reward model integration | If we want a learned reward (vs. rule-based), `trl` handles it |
+
+> [!IMPORTANT]
+> **Phase 2 action item:** Switch from raw `transformers.Trainer` to `trl.SFTTrainer`. Use `DataCollatorForCompletionOnlyLM` to only compute loss on the assistant's CoT+answer tokens, not the question. This is the correct training setup for instruction fine-tuning and should improve convergence.
+
+> [!IMPORTANT]
+> **Phase 3 action item:** Use `trl.GRPOTrainer` directly. Remove the "custom PyTorch GRPO" fallback from the plan — it is no longer needed.
+
+---
+
+#### ✅ Unsloth Compatibility — Corrected Re-evaluation
+
+**Verdict: Unsloth IS officially supported for Nemotron-3-Nano-30B-A3B.**
+
+> [!IMPORTANT]
+> My previous analysis was wrong in its conclusion. The architectural reasoning about Mamba/SSM
+> was correct, but I failed to account for the fact that Unsloth and NVIDIA formed an explicit
+> partnership to add **Day Zero** support for Nemotron-3-Nano. This is not a generic claim —
+> Unsloth wrote custom hybrid-patching code for this specific model family.
+
+**What changed / why the original analysis was wrong:**
+
+The original reasoning was sound for generic Unsloth + Mamba: Unsloth's Triton kernels target attention layers and have no knowledge of SSM ops. **However**, for Nemotron-3-Nano specifically, Unsloth engineers wrote dedicated support:
+
+- `FastLanguageModel.from_pretrained` detects the Mamba-Transformer hybrid architecture and applies **model-specific patches**, not generic attention patches.
+- The Mamba/SSM layers are left **unpatched** (Unsloth does not touch them) — the speedups come from patching the Transformer attention layers that do exist in the hybrid, plus fused cross-entropy and RoPE where applicable.
+- Unsloth provides dedicated notebooks for the 30B-A3B model, including correct `<think>` token handling and LoRA target module selection for hybrid architectures.
+
+**Confirmed installed versions** (from `lokeshvns/nvidia-utility-script-e0429c` verification run, 2026-06-07):
+
+| Package | Confirmed Version | Status |
+|---|---|---|
+| PyTorch | `2.10.0+cu128` | ✅ |
+| Transformers | `5.3.0` | ✅ |
+| Unsloth | latest (patching active) | ✅ (see numpy note below) |
+| PEFT | `0.19.1` | ✅ (within Unsloth's `>=0.18.0` requirement) |
+| TRL | `0.24.0` | ✅ (within Unsloth's `>=0.18.2,<=0.24.0` range) |
+| Mamba-SSM | `2.3.2.post1` | ✅ confirmed present |
+| causal-conv1d | `>=1.4.0` (installed) | ✅ confirmed present |
+| GPU (Kaggle T4) | Tesla T4 | ✅ CUDA available |
+
+**Key practical details:**
+| Detail | Value |
+|---|---|
+| VRAM for 16-bit LoRA (30B-A3B) | ~60 GB — **does NOT fit T4 (16 GB)**; use RTX 6000 session |
+| VRAM for 4-bit QLoRA (30B-A3B) | ~24 GB — marginal on T4; use RTX 6000 session |
+| Recommended LoRA rank on Mamba projections | Conservative (r=4–8 on SSM layers) |
+| Chat template handling | Unsloth notebooks include correct `<think>`/`</think>` token setup |
+| HuggingFace checkpoints | Use `unsloth/` prefixed model checkpoints for best compatibility |
+| Install command | `uv pip install --target=/kaggle/working unsloth peft trl datasets accelerate` |
+
+> [!IMPORTANT]
+> **The `🔴 FAILED` in the verification output is a FALSE ALARM.** The actual error is:
+> ```
+> numpy was upgraded mid-session (loaded: 2.4.6, installed: 2.4.4) but the kernel still
+> has the old version in memory. Please restart your runtime/kernel after installing packages.
+> ```
+> This is a standard Python session-reload issue — numpy uses C extensions that can't be
+> hot-swapped. It has nothing to do with Unsloth or Mamba compatibility.
+>
+> **Fix:** Always **restart the kernel** between Cell 1 (install) and Cell 2 (import/verify).
+> After restart, all packages import correctly and `🟢 SUCCESS` is expected.
+>
+> **Confirmed working order:**
+> 1. Run Cell 1 (install all packages via `uv pip`)
+> 2. **Kernel → Restart** (critical)
+> 3. Add `sys.path.insert(0, "/kaggle/working")` at top of next cell
+> 4. `import unsloth` **before** `import transformers` (the UserWarning confirms this requirement)
+> 5. Run training code
+
+> [!NOTE]
+> **Import order warning is real:** The verification output showed:
+> ```
+> WARNING: Unsloth should be imported before [transformers] to ensure all optimizations are applied.
+> ```
+> Always put `import unsloth` as the **first import** in training notebooks. Violating this
+> means Unsloth patches don't apply → slower training, no memory savings.
+
+**Kaggle offline environment — CONFIRMED ✅**
+
+> [!NOTE]
+> Utility script kernel **`lokeshvns/nvidia-utility-script-e0429c`** installs the full stack:
+> - Uninstalls default Kaggle torch, reinstalls `torch==2.10.0+cu128`
+> - Installs `causal-conv1d>=1.4.0` (required for Mamba layers)
+> - Installs `mamba-ssm` from source (`github.com/state-spaces/mamba`)
+> - Installs `transformers==5.3.0`, `unsloth`, `peft`, `trl`, `datasets`, `accelerate`
+> - All packages land in `/kaggle/working` → add to `sys.path` at notebook start
+>
+> **Use `accelerator=nvidiaRtxPro6000`** in the notebook metadata for the 95 GB GPU session.
+> The T4 in the verification run cannot fit the 30B model — always use RTX 6000 for training.
+

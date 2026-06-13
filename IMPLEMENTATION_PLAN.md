@@ -9,7 +9,7 @@ The benchmark metric is **Accuracy** — the fraction of `\boxed{}` answers that
 exactly or within a small numerical tolerance.
 
 **Execution environment:** Local workstation with RTX 6000 (Ada Generation, ~48GB VRAM) (No Internet)
-**Training library:** Native PyTorch with HuggingFace PEFT and Transformers Trainer (Unsloth incompatible with Mamba, and no trl available offline)
+**Training library:** `transformers` + `peft` + `trl` (SFTTrainer / GRPOTrainer) — all confirmed available offline. **Unsloth also available** via utility script kernel `lokeshvns/nvidia-utility-script-e0429c` (NVIDIA Day Zero partnership; handles Mamba-Transformer hybrid patching). See NOTES.md for full analysis.
 **CoT generation:** Gemini free API (gemini-2.0-flash or gemini-2.5-flash) — *or* alternative
 (Groq / OpenAI) if Gemini quota is exhausted
 
@@ -426,9 +426,14 @@ if Phase 2 is working well and time remains.
 ### Compute Strategy for Phase 3
 
 > [!NOTE]
+> **`trl` is now confirmed available in the Kaggle offline container.** ✅
+> Use `trl.GRPOTrainer` as the **primary approach** for Phase 3 — no custom RL loop needed.
+> The custom PyTorch fallback is no longer necessary.
+
+> [!NOTE]
 > Kaggle TPU v3-8 is available for free but we are constrained to offline RTX 6000 hardware.
-> Also, **TRL's GRPOTrainer is unavailable offline**. We will need to implement a custom RL loop
-> or use purely SFT. **Recommended approach for Phase 3: Stick to supervised learning or implement custom GRPO with pure PyTorch**, since `trl` is unavailable.
+> `trl.GRPOTrainer` is now available and is the recommended approach.
+> Use `trl.SFTTrainer` for Phase 2 (with `DataCollatorForCompletionOnlyLM` to mask prompt tokens during loss computation).
 
 ### Why GRPO over PPO
 - No separate value/critic model → much more memory-efficient
@@ -562,7 +567,7 @@ nemotron_reasoning_challenge/
 | STaR adapter reuse | Phase 1 adapter for BOTH generation AND training init | Teacher knows domain; warm-start cuts epochs 3→2; quality filter prevents circular reinforcement |
 | Pipeline validation | Qwen2.5-7B proxy first | Catch format/pipeline bugs before spending 30B GPU hours |
 | Augmentation | Run both with/without, benchmark | Empirical — can't know without trying |
-| Phase 3 compute | Local RTX 6000 | Custom PyTorch GRPO required since TRL unavailable |
+| Phase 3 compute | Local RTX 6000 | `trl.GRPOTrainer` (now available ✅) — no custom PyTorch GRPO needed |
 | Phase 3 priority | Aspirational/bonus | Time and memory constrained |
 | Code structure | Separate notebooks per phase | Easier to iterate, cleaner Kaggle sessions |
 | LoRA rank | 32 (max allowed by competition) | Maximize adapter capacity |
